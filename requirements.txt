@@ -1,0 +1,6 @@
+aiohttp
+aiosqlite
+cryptography
+pydantic-settings
+python-dotenv
+python-telegram-bot==20.7
