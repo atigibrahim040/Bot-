@@ -1,0 +1,31 @@
+name: Plague v22.1 – Low Memory
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # every 6 hours (max allowed)
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest   # 4 vCPU, 16 GB RAM, 14 GB SSD
+    timeout-minutes: 350     # < 6h to avoid hard kill
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Run
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python plague_optimized.py
+      - name: Auto-restart
+        if: always()
+        run: gh workflow run plague_v22.1.yml -R ${{ github.repository }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
