@@ -6,17 +6,67 @@ on:
   workflow_dispatch:
 
 jobs:
+  # ---------------------------------------------------------------
+  # المرحلة 1: تنظيف كل العمليات القديمة والنشطة
+  # ---------------------------------------------------------------
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write   # ضروري لحذف/إلغاء العمليات
+      contents: read
+    steps:
+      - name: Cancel all active runs
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          REPO: ${{ github.repository }}
+          CURRENT_RUN: ${{ github.run_id }}
+        run: |
+          echo "🛑 Cancelling all active runs (except current)..."
+          gh run list --repo "$REPO" --limit 100 --json databaseId,status,workflowName \
+            --jq '.[] | select(.status=="in_progress" or .status=="queued" or .status=="waiting") | .databaseId' \
+            | while read -r id; do
+                if [ "$id" != "$CURRENT_RUN" ]; then
+                  echo "  → Cancelling run $id"
+                  gh run cancel "$id" --repo "$REPO" || true
+                fi
+              done
+          echo "✅ Cancellation done."
+
+      - name: Delete all previous runs
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          REPO: ${{ github.repository }}
+          CURRENT_RUN: ${{ github.run_id }}
+        run: |
+          echo "🗑️ Deleting all previous runs (except current)..."
+          gh run list --repo "$REPO" --limit 200 --json databaseId \
+            --jq '.[].databaseId' \
+            | while read -r id; do
+                if [ "$id" != "$CURRENT_RUN" ]; then
+                  echo "  → Deleting run $id"
+                  gh run delete "$id" --repo "$REPO" || true
+                fi
+              done
+          echo "✅ Deletion done."
+
+  # ---------------------------------------------------------------
+  # المرحلة 2: تشغيل الطاعون بعد التنظيف
+  # ---------------------------------------------------------------
   run:
+    needs: cleanup
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - name: Install deps
+
+      - name: Install dependencies
         run: pip install -r requirements.txt
-      - name: Run
+
+      - name: Run Plague v24
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
@@ -24,8 +74,10 @@ jobs:
           ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: python plague_v24.py
+
       - name: Auto-restart
         if: always()
-        run: gh workflow run plague_v24.yml -R ${{ github.repository }}
+        run: |
+          gh workflow run plague_v24.yml -R ${{ github.repository }}
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
