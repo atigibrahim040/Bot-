@@ -73,7 +73,7 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
           ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-        run: python plague_v24.py
+        run: python plague_optimized.py
 
       - name: Auto-restart
         if: always()
